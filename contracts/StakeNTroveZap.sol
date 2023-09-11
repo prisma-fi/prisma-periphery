@@ -106,7 +106,6 @@ contract StakeNTroveZap is Ownable {
     /// @notice Stakes and open a trove
     function openTrove(
         ITroveManager troveManager,
-        address account,
         uint256 _maxFeePercentage,
         uint256 ethAmount,
         uint256 _debtAmount,
@@ -116,7 +115,7 @@ contract StakeNTroveZap is Ownable {
         uint256 staked = _stake(troveManager.collateralToken(), ethAmount);
         borrowerOps.openTrove(
             address(troveManager),
-            account,
+            msg.sender,
             _maxFeePercentage,
             staked,
             _debtAmount,
@@ -129,18 +128,16 @@ contract StakeNTroveZap is Ownable {
     /// @notice Stakes and adds collateral to an existing trove
     function addColl(
         ITroveManager troveManager,
-        address account,
         uint256 ethAmount,
         address _upperHint,
         address _lowerHint
     ) external payable {
-        adjustTrove(troveManager, account, 0, ethAmount, 0, false, _upperHint, _lowerHint);
+        adjustTrove(troveManager, 0, ethAmount, 0, false, _upperHint, _lowerHint);
     }
 
     /// @notice Stakes and adjusts a trove
     function adjustTrove(
         ITroveManager troveManager,
-        address account,
         uint256 _maxFeePercentage,
         uint256 ethAmount,
         uint256 _debtChange,
@@ -151,7 +148,7 @@ contract StakeNTroveZap is Ownable {
         uint256 staked = _stake(troveManager.collateralToken(), ethAmount);
         borrowerOps.adjustTrove(
             address(troveManager),
-            account,
+            msg.sender,
             _maxFeePercentage,
             staked,
             0,
