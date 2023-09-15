@@ -44,9 +44,11 @@ contract rETHDepositor {
 contract StakeNTroveZap is Ownable {
     using SafeERC20 for IERC20;
     using SafeERC20 for IWETH;
+    using Address for address;
 
     struct StakingRecord {
         address stakingContract;
+        bytes4 sharePriceSig;
         bytes payload;
     }
     // Events ---------------------------------------------------------------------------------------------------------
@@ -76,11 +78,17 @@ contract StakeNTroveZap is Ownable {
         @notice Registers a token to be zapped
         @param  token Token to be registered
         @param  stakingContract Contract which stakes and mint the token (can be the token itself)
-        @param  payload Call data to invoke on the staking contract
+        @param  sharePriceSig Signature for token's share price view method
+        @param  stakingPayload Call data to invoke on the staking contract
      */
-    function registerToken(address token, address stakingContract, bytes calldata payload) external onlyOwner {
+    function registerToken(
+        address token,
+        address stakingContract,
+        bytes4 sharePriceSig,
+        bytes calldata stakingPayload
+    ) external onlyOwner {
         require(stakingRecords[token].stakingContract == address(0), "Token already registered");
-        stakingRecords[token] = StakingRecord(stakingContract, payload);
+        stakingRecords[token] = StakingRecord(stakingContract, sharePriceSig, stakingPayload);
         IERC20(token).approve(address(borrowerOps), type(uint256).max);
 
         emit NewTokenRegistered(token);
@@ -102,6 +110,18 @@ contract StakeNTroveZap is Ownable {
     }
 
     // Public functions -------------------------------------------------------------------------------------------------
+
+    /**
+        @notice Get the share price for `token`
+        @dev Returns 0 if token is unregistered or misconfigured
+     */
+    function getSharePrice(address token) external view returns (uint256) {
+        if (!token.isContract()) return 0;
+        bytes memory sig = abi.encode(stakingRecords[token].sharePriceSig);
+        (bool success, bytes memory response) = token.staticcall(sig);
+        if (!success || response.length < 32) return 0;
+        return abi.decode(response, (uint256));
+    }
 
     /// @notice Stakes and open a trove
     function openTrove(
