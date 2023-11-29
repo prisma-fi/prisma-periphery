@@ -4,7 +4,6 @@ pragma solidity 0.8.19;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "./interfaces/IDepositToken.sol";
 import "./interfaces/IVault.sol";
 
 interface ICurveToken {
@@ -64,6 +63,16 @@ interface ICurvePool4 is ICurvePool {
     function calc_token_amount(uint256[4] calldata _amounts, bool _is_deposit) external view returns (uint256);
 }
 
+interface IDepositToken {
+    function emissionId() external view returns (uint256);
+
+    function lpToken() external view returns (address);
+
+    function deposit(address receiver, uint256 amount) external returns (bool);
+
+    function withdraw(address receiver, uint256 amount) external returns (bool);
+}
+
 /**
     @title PRISMA Curve Deposit Zap
     @notice Deposits tokens into Curve and stakes LP tokens into Curve/Convex via Prisma
@@ -83,6 +92,9 @@ contract CurveDepositZap is Ownable {
     mapping(address lpToken => CurvePool) poolData;
     mapping(address depositToken => address lpToken) depositTokenToLpToken;
 
+    event PoolAdded(address pool, address lpToken, bool isMetapool, bool isCryptoswap, address[] coins);
+    event DepositTokenRegistered(address depositToken, address pool);
+
     constructor(IPrismaVault _vault, address[2][] memory _basePools) {
         vault = _vault;
         for (uint i = 0; i < _basePools.length; i++) {
@@ -95,9 +107,7 @@ contract CurveDepositZap is Ownable {
         @dev Arrays for `amounts` or `minReceived` correspond to the returned coins
      */
     function getCoins(address depositToken) public view returns (address[] memory coins) {
-        address lpToken = IDepositToken(depositToken).lpToken();
-        CurvePool memory pool = poolData[lpToken];
-        require(pool.pool != address(0), "depositToken not registered");
+        (, CurvePool memory pool) = _getDepositTokenData(depositToken);
 
         if (!pool.isMetapool) {
             return pool.coins;
@@ -117,9 +127,7 @@ contract CurveDepositZap is Ownable {
         @dev Used to calculate `minReceived` when calling `addLiquidity`
      */
     function getAddLiquidityReceived(address depositToken, uint256[] memory amounts) external view returns (uint256) {
-        address lpToken = depositTokenToLpToken[depositToken];
-        CurvePool memory pool = poolData[lpToken];
-        require(pool.pool != address(0), "depositToken not registered");
+        (, CurvePool memory pool) = _getDepositTokenData(depositToken);
 
         if (pool.isMetapool) {
             CurvePool memory basePool = poolData[pool.coins[1]];
@@ -166,6 +174,8 @@ contract CurveDepositZap is Ownable {
                     true
                 );
         }
+        // should be impossible to get here
+        revert();
     }
 
     /**
@@ -177,9 +187,7 @@ contract CurveDepositZap is Ownable {
         address depositToken,
         uint256 burnAmount
     ) external view returns (uint256[] memory received) {
-        address lpToken = depositTokenToLpToken[depositToken];
-        CurvePool memory pool = poolData[lpToken];
-        require(pool.pool != address(0), "depositToken not registered");
+        (address lpToken, CurvePool memory pool) = _getDepositTokenData(depositToken);
 
         if (pool.isMetapool) {
             CurvePool memory basePool = poolData[pool.coins[1]];
@@ -215,9 +223,7 @@ contract CurveDepositZap is Ownable {
         uint256 burnAmount,
         uint256 index
     ) external view returns (uint256) {
-        address lpToken = depositTokenToLpToken[depositToken];
-        CurvePool memory pool = poolData[lpToken];
-        require(pool.pool != address(0), "depositToken not registered");
+        (, CurvePool memory pool) = _getDepositTokenData(depositToken);
 
         if (index != 0 && pool.isMetapool) {
             if (pool.isCryptoswap) {
@@ -258,17 +264,60 @@ contract CurveDepositZap is Ownable {
      */
     function registerDepositToken(address depositToken) external {
         require(depositTokenToLpToken[depositToken] == address(0), "Already registered");
-        _registerDepositToken(depositToken);
+        _getDepositTokenDataWrite(depositToken);
     }
 
-    function _addPoolData(address pool, address lpToken) internal {
-        poolData[lpToken].pool = pool;
+    /**
+        @dev Fetch data about the Curve pool related to `depositToken`
+     */
+    function _getDepositTokenData(address depositToken) internal view returns (address lpToken, CurvePool memory pd) {
+        lpToken = IDepositToken(depositToken).lpToken();
+        address pool = _getPoolFromLpToken(lpToken);
+        return (lpToken, _getPoolData(pool));
+    }
+
+    /**
+        @dev Non-view version of `_getDepositTokenData`. The first call for each
+             `depositToken` stores data locally and sets required token approvals.
+     */
+    function _getDepositTokenDataWrite(address depositToken) internal returns (CurvePool memory pd) {
+        address lpToken = depositTokenToLpToken[depositToken];
+        if (lpToken != address(0)) return poolData[lpToken];
+
+        lpToken = IDepositToken(depositToken).lpToken();
+        depositTokenToLpToken[depositToken] = lpToken;
+        pd = poolData[lpToken];
+
+        //address pool = poolData[lpToken].pool;
+        if (pd.pool == address(0)) {
+            uint256 id = IDepositToken(depositToken).emissionId();
+            (address receiver, ) = vault.idToReceiver(id);
+            require(receiver == depositToken, "receiver != depositToken");
+
+            pd = _addPoolData(_getPoolFromLpToken(lpToken), lpToken);
+        }
+        IERC20(lpToken).safeApprove(depositToken, type(uint256).max);
+        emit DepositTokenRegistered(depositToken, pd.pool);
+        return pd;
+    }
+
+    function _addPoolData(address pool, address lpToken) internal returns (CurvePool memory pd) {
+        pd = _getPoolData(pool);
+        for (uint i = 0; i < pd.coins.length; i++) {
+            IERC20(pd.coins[i]).safeApprove(pd.pool, type(uint256).max);
+        }
+        poolData[lpToken] = pd;
+        emit PoolAdded(pd.pool, lpToken, pd.isMetapool, pd.isCryptoswap, pd.coins);
+        return pd;
+    }
+
+    function _getPoolData(address pool) internal view returns (CurvePool memory pd) {
+        pd.pool = pool;
         address[] memory coins = new address[](4);
         uint256 i;
         for (; i < 4; i++) {
             try ICurvePool(pool).coins(i) returns (address _coin) {
                 coins[i] = _coin;
-                IERC20(_coin).safeApprove(pool, type(uint256).max);
             } catch {
                 assembly {
                     mstore(coins, i)
@@ -276,36 +325,23 @@ contract CurveDepositZap is Ownable {
                 break;
             }
         }
-        poolData[lpToken].coins = coins;
+        pd.coins = coins;
         address lastCoin = coins[i - 1];
         address basePool = poolData[lastCoin].pool;
-        if (basePool != address(0)) poolData[lpToken].isMetapool = true;
+        if (basePool != address(0)) pd.isMetapool = true;
         try ICurvePoolV2(pool).gamma() returns (uint256) {
-            poolData[lpToken].isCryptoswap = true;
-        } catch {
-            poolData[lpToken].isCryptoswap = false;
-        }
+            pd.isCryptoswap = true;
+        } catch {}
+        return pd;
     }
 
-    function _registerDepositToken(address depositToken) internal returns (address lpToken) {
-        lpToken = IDepositToken(depositToken).lpToken();
-        depositTokenToLpToken[depositToken] = lpToken;
-
-        address pool = poolData[lpToken].pool;
-        if (pool == address(0)) {
-            uint256 id = IDepositToken(depositToken).emissionId();
-            (address receiver, ) = vault.idToReceiver(id);
-            require(receiver == depositToken, "receiver != depositToken");
-
-            try ICurveToken(lpToken).minter() returns (address _pool) {
-                pool = _pool;
-            } catch {
-                pool = lpToken;
-            }
-            _addPoolData(pool, lpToken);
+    function _getPoolFromLpToken(address lpToken) internal view returns (address pool) {
+        try ICurveToken(lpToken).minter() returns (address _pool) {
+            pool = _pool;
+        } catch {
+            pool = lpToken;
         }
-        IERC20(lpToken).safeApprove(depositToken, type(uint256).max);
-        return lpToken;
+        return pool;
     }
 
     /**
@@ -322,10 +358,7 @@ contract CurveDepositZap is Ownable {
         uint256 minReceived,
         address receiver
     ) external returns (uint256 lpTokenAmount) {
-        address lpToken = depositTokenToLpToken[depositToken];
-        if (lpToken == address(0)) lpToken = _registerDepositToken(depositToken);
-
-        CurvePool memory pool = poolData[lpToken];
+        CurvePool memory pool = _getDepositTokenDataWrite(depositToken);
         if (amounts[0] > 0) IERC20(pool.coins[0]).safeTransferFrom(msg.sender, address(this), amounts[0]);
 
         if (pool.isMetapool) {
@@ -380,6 +413,8 @@ contract CurveDepositZap is Ownable {
                     minReceived
                 );
         }
+        // should be impossible to get here
+        revert();
     }
 
     /**
@@ -396,13 +431,11 @@ contract CurveDepositZap is Ownable {
         uint256[] calldata minReceived,
         address receiver
     ) external returns (uint256[] memory received) {
-        address lpToken = depositTokenToLpToken[depositToken];
-        if (lpToken == address(0)) lpToken = _registerDepositToken(depositToken);
+        CurvePool memory pool = _getDepositTokenDataWrite(depositToken);
 
         IERC20(depositToken).transferFrom(msg.sender, address(this), burnAmount);
         IDepositToken(depositToken).withdraw(address(this), burnAmount);
 
-        CurvePool memory pool = poolData[lpToken];
         if (pool.isMetapool) return _removeLiquidityMeta(pool, burnAmount, minReceived, receiver);
         else return _removeLiquidityPlain(pool, burnAmount, minReceived, receiver);
     }
@@ -487,13 +520,11 @@ contract CurveDepositZap is Ownable {
         uint256 minReceived,
         address receiver
     ) external returns (uint256) {
-        address lpToken = depositTokenToLpToken[depositToken];
-        if (lpToken == address(0)) lpToken = _registerDepositToken(depositToken);
+        CurvePool memory pool = _getDepositTokenDataWrite(depositToken);
 
         IERC20(depositToken).transferFrom(msg.sender, address(this), burnAmount);
         IDepositToken(depositToken).withdraw(address(this), burnAmount);
 
-        CurvePool memory pool = poolData[lpToken];
         if (index != 0 && pool.isMetapool) {
             if (pool.isCryptoswap) {
                 burnAmount = ICurvePoolV2(pool.pool).remove_liquidity_one_coin(burnAmount, 1, 0);
