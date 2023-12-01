@@ -63,6 +63,16 @@ interface ICurvePool4 is ICurvePool {
     function calc_token_amount(uint256[4] calldata _amounts, bool _is_deposit) external view returns (uint256);
 }
 
+interface ICurvePoolNg {
+    function N_COINS() external view returns (uint256);
+
+    function add_liquidity(uint256[] calldata amounts, uint256 min_mint_amount) external returns (uint256);
+
+    function remove_liquidity(uint256 burn_amount, uint256[] calldata min_amounts) external;
+
+    function calc_token_amount(uint256[] calldata amounts, bool is_deposit) external view returns (uint256);
+}
+
 interface IDepositToken {
     function emissionId() external view returns (uint256);
 
@@ -76,6 +86,8 @@ interface IDepositToken {
 /**
     @title PRISMA Curve Deposit Zap
     @notice Deposits tokens into Curve and stakes LP tokens into Curve/Convex via Prisma
+    @dev Integrating Curve is difficult because of a lack of standard interfaces. This zap
+         appears to work today, but there is no guarantee it will work tomorrow.
  */
 contract CurveDepositZap is Ownable {
     using SafeERC20 for IERC20;
@@ -84,6 +96,7 @@ contract CurveDepositZap is Ownable {
         address pool;
         bool isMetapool;
         bool isCryptoswap;
+        bool isStableNg;
         address[] coins;
     }
 
@@ -157,6 +170,9 @@ contract CurveDepositZap is Ownable {
     ) internal view returns (uint256) {
         uint256 numCoins = pool.coins.length;
 
+        if (pool.isStableNg) {
+            return ICurvePoolNg(pool.pool).calc_token_amount(amounts, true);
+        }
         if (numCoins == 2) {
             if (pool.isCryptoswap) {
                 return ICurvePoolV2(pool.pool).calc_token_amount([amounts[i], amounts[i + 1]]);
@@ -331,7 +347,11 @@ contract CurveDepositZap is Ownable {
         if (basePool != address(0)) pd.isMetapool = true;
         try ICurvePoolV2(pool).gamma() returns (uint256) {
             pd.isCryptoswap = true;
-        } catch {}
+        } catch {
+            try ICurvePoolNg(pool).N_COINS() returns (uint256) {
+                pd.isStableNg = true;
+            } catch {}
+        }
         return pd;
     }
 
@@ -373,7 +393,7 @@ contract CurveDepositZap is Ownable {
                 }
             }
             if (isBaseDeposit) {
-                amounts[1] = _addLiquidity(basePool.pool, length - 1, 1, amounts, 0);
+                amounts[1] = _addLiquidity(basePool, length - 1, 1, amounts, 0);
             } else {
                 amounts[1] = 0;
             }
@@ -386,7 +406,7 @@ contract CurveDepositZap is Ownable {
                 }
             }
         }
-        lpTokenAmount = _addLiquidity(pool.pool, pool.coins.length, 0, amounts, minReceived);
+        lpTokenAmount = _addLiquidity(pool, pool.coins.length, 0, amounts, minReceived);
 
         IDepositToken(depositToken).deposit(receiver, lpTokenAmount);
 
@@ -394,21 +414,24 @@ contract CurveDepositZap is Ownable {
     }
 
     function _addLiquidity(
-        address pool,
+        CurvePool memory pool,
         uint256 numCoins,
         uint256 i,
         uint256[] memory amounts,
         uint256 minReceived
     ) internal returns (uint256) {
+        if (pool.isStableNg) {
+            return ICurvePoolNg(pool.pool).add_liquidity(amounts, minReceived);
+        }
         if (numCoins == 2) {
-            return ICurvePool2(pool).add_liquidity([amounts[i], amounts[i + 1]], minReceived);
+            return ICurvePool2(pool.pool).add_liquidity([amounts[i], amounts[i + 1]], minReceived);
         }
         if (numCoins == 3) {
-            return ICurvePool3(pool).add_liquidity([amounts[i], amounts[i + 1], amounts[i + 2]], minReceived);
+            return ICurvePool3(pool.pool).add_liquidity([amounts[i], amounts[i + 1], amounts[i + 2]], minReceived);
         }
         if (numCoins == 4) {
             return
-                ICurvePool4(pool).add_liquidity(
+                ICurvePool4(pool.pool).add_liquidity(
                     [amounts[i], amounts[i + 1], amounts[i + 2], amounts[i + 3]],
                     minReceived
                 );
@@ -451,7 +474,7 @@ contract CurveDepositZap is Ownable {
         require(minReceived.length == length + 1, "Incorrect minReceived.length");
         uint256[] memory received = new uint256[](length + 1);
 
-        _removeLiquidity(pool.pool, 2, burnAmount);
+        _removeLiquidity(pool, 2, burnAmount);
 
         IERC20 coin = IERC20(pool.coins[0]);
         uint256 amount = coin.balanceOf(address(this));
@@ -460,7 +483,7 @@ contract CurveDepositZap is Ownable {
         received[0] = amount;
 
         burnAmount = IERC20(pool.coins[1]).balanceOf(address(this));
-        _removeLiquidity(basePool.pool, length, burnAmount);
+        _removeLiquidity(basePool, length, burnAmount);
 
         for (uint i = 0; i < length; i++) {
             coin = IERC20(basePool.coins[i]);
@@ -482,7 +505,7 @@ contract CurveDepositZap is Ownable {
         require(minReceived.length == length, "Incorrect minReceived.length");
         uint256[] memory received = new uint256[](length);
 
-        _removeLiquidity(pool.pool, length, burnAmount);
+        _removeLiquidity(pool, length, burnAmount);
 
         for (uint i = 0; i < length; i++) {
             IERC20 coin = IERC20(pool.coins[i]);
@@ -494,13 +517,15 @@ contract CurveDepositZap is Ownable {
         return received;
     }
 
-    function _removeLiquidity(address pool, uint256 numCoins, uint256 burnAmount) internal {
-        if (numCoins == 2) {
-            ICurvePool2(pool).remove_liquidity(burnAmount, [uint256(0), uint256(0)]);
+    function _removeLiquidity(CurvePool memory pool, uint256 numCoins, uint256 burnAmount) internal {
+        if (pool.isStableNg) {
+            ICurvePoolNg(pool.pool).remove_liquidity(burnAmount, new uint256[](numCoins));
+        } else if (numCoins == 2) {
+            ICurvePool2(pool.pool).remove_liquidity(burnAmount, [uint256(0), uint256(0)]);
         } else if (numCoins == 3) {
-            ICurvePool3(pool).remove_liquidity(burnAmount, [uint256(0), uint256(0), uint256(0)]);
+            ICurvePool3(pool.pool).remove_liquidity(burnAmount, [uint256(0), uint256(0), uint256(0)]);
         } else if (numCoins == 4) {
-            ICurvePool4(pool).remove_liquidity(burnAmount, [uint256(0), uint256(0), uint256(0), uint256(0)]);
+            ICurvePool4(pool.pool).remove_liquidity(burnAmount, [uint256(0), uint256(0), uint256(0), uint256(0)]);
         }
     }
 
@@ -544,5 +569,29 @@ contract CurveDepositZap is Ownable {
         IERC20(pool.coins[index]).safeTransfer(receiver, amount);
 
         return amount;
+    }
+
+    /**
+        @notice Withdraw from `srcToken` and deposit to `destToken`
+        @dev `srcToken` and `destToken` must both use the same LP token
+        @param srcToken Address of `CurveDepositToken` or `ConvexDepositToken` to withdraw from
+        @param destToken Address of `CurveDepositToken` or `ConvexDepositToken` to deposit to
+        @param amount Quantity of tokens to transfer
+        @param receiver Address to send `destToken` balance to
+     */
+    function zapBetweenCurveConvex(
+        address srcToken,
+        address destToken,
+        uint256 amount,
+        address receiver
+    ) external returns (bool) {
+        address srcPool = _getDepositTokenDataWrite(srcToken).pool;
+        address destPool = _getDepositTokenDataWrite(destToken).pool;
+        require(srcPool == destPool, "Pools use different LP tokens");
+        IERC20(srcToken).transferFrom(msg.sender, address(this), amount);
+        IDepositToken(srcToken).withdraw(address(this), amount);
+        IDepositToken(destToken).deposit(receiver, amount);
+
+        return true;
     }
 }
